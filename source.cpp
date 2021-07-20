@@ -232,7 +232,7 @@ void tpool_wait(tpool_t *tm)
     pthread_mutex_unlock(&(tm->work_mutex));
 }
 
-static const size_t num_threads = 64;
+static const size_t num_threads = 128;
 
 struct packetArgs {
     struct nfq_q_handle *queue;
@@ -247,8 +247,9 @@ struct packetArgs {
     }
 };
 
+#define PACKET_LEN (sizeof(struct iphdr) + sizeof(struct tcphdr))
+
 void verdict_thread(void *args) {
-    //std::cout << "Thread: " << id << std::endl;
     packetArgs *data = static_cast<packetArgs *>(args);
     struct nfqnl_msg_packet_hdr *ph = nfq_get_msg_packet_hdr(data->nfad);
     THROW_IF_TRUE(ph == nullptr, "Issue while packet header output.");
@@ -262,20 +263,32 @@ void verdict_thread(void *args) {
     SCOPED_GUARD(pktb_free(pkBuff););
 
     struct iphdr *ip = nfq_ip_get_hdr(pkBuff);
+    
     THROW_IF_TRUE(ip == nullptr, "Issue while ipv4 header output.");
-    ip->ttl = 128;
     THROW_IF_TRUE(nfq_ip_set_transport_header(pkBuff, ip) < 0, "Can\'t set transport header output.");
+
     if (ip->protocol == IPPROTO_TCP) {
         struct tcphdr *tcp = nfq_tcp_get_hdr(pkBuff);
         THROW_IF_TRUE(tcp == nullptr, "Issue while tcp header.");
-        std::cout << tcp->th_sport << std::endl;
+        //ip->version = 0x4;
+        //ip->ihl = 0x5;
+        //ip->tos = 0;
+        ip->tot_len = htons(PACKET_LEN+len);
+        //ip->id = 0;
+        ip->frag_off = 0x0;//htons(IP_DF);
+        //ip->ttl = 64;
+        //ip->check = 0;
+        
+        tcp->doff = 0x6;
+        tcp->window = htons(65535);
+        //tcp->check = 0;
+        //tcp->urg_ptr = 0;
+
         nfq_ip_set_checksum(ip);
         nfq_tcp_compute_checksum_ipv4(tcp, ip);
-        //std::cout << "Packet changed output" << std::endl;
+        
         nfq_set_verdict(data->queue, ntohl(ph->packet_id), NF_ACCEPT, pktb_len(pkBuff), pktb_data(pkBuff));
-    } else {
-        nfq_set_verdict(data->queue, ntohl(ph->packet_id), NF_ACCEPT, 0, nullptr);
-    }
+    } else nfq_set_verdict(data->queue, ntohl(ph->packet_id), NF_ACCEPT, 0, nullptr);
     delete args;
 }
 
@@ -294,19 +307,17 @@ void input_verdict_thread(void *args) {
 
     struct iphdr *ip = nfq_ip_get_hdr(pkBuff);
 
+    std::cout << sizeof(nfq_ip_get_hdr(pkBuff)) << std::endl;
+
     THROW_IF_TRUE(ip == nullptr, "Issue while ipv4 header.");
     THROW_IF_TRUE(nfq_ip_set_transport_header(pkBuff, ip) < 0, "Can\'t set transport header.");
     if (ip->protocol == IPPROTO_TCP) {
         struct tcphdr *tcp = nfq_tcp_get_hdr(pkBuff);
         THROW_IF_TRUE(tcp == nullptr, "Issue while tcp header.");
-        ip->ttl = 128;
         nfq_ip_set_checksum(ip);
         nfq_tcp_compute_checksum_ipv4(tcp, ip);
-        //std::cout << "Packet changed" << std::endl;
         nfq_set_verdict(data->queue, ntohl(ph->packet_id), NF_ACCEPT, pktb_len(pkBuff), pktb_data(pkBuff));
-    } else {
-        nfq_set_verdict(data->queue, ntohl(ph->packet_id), NF_ACCEPT, 0, nullptr);
-    }
+    } else nfq_set_verdict(data->queue, ntohl(ph->packet_id), NF_ACCEPT, 0, nullptr);
     delete args;
 }
 
@@ -315,12 +326,10 @@ tpool_t *input;
 
 static int netfilterCallback(struct nfq_q_handle *queue, struct nfgenmsg *nfmsg, struct nfq_data *nfad, void *data) {
     return tpool_add_work(tm, verdict_thread, new packetArgs(queue, nfmsg, nfad, data));
-    //pthread_create(&id, nullptr, verdict_thread, new packetArgs(queue, nfmsg, nfad, data));
 }
 
 static int input_netfilterCallback(struct nfq_q_handle *queue, struct nfgenmsg *nfmsg, struct nfq_data *nfad, void *data) {
     return tpool_add_work(input, input_verdict_thread, new packetArgs(queue, nfmsg, nfad, data));
-    //pthread_create(&id, nullptr, verdict_thread, new packetArgs(queue, nfmsg, nfad, data));
 }
 
 void* input_thread(void *arg) {
@@ -347,8 +356,9 @@ void* input_thread(void *arg) {
 }
 
 int main() {
-    pthread_t id;
-    pthread_create(&id, nullptr, input_thread, nullptr);
+    /*pthread_t id;
+    pthread_create(&id, nullptr, input_thread, nullptr);*/
+
     struct nfq_handle * handler = nfq_open();
     THROW_IF_TRUE(handler == nullptr, "Can\'t open nfqueue handler.");
     SCOPED_GUARD(nfq_close(handler););
